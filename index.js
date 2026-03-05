@@ -41,17 +41,59 @@ async function sendWebhook(event, data) {
   }
 }
 
-// Send message via WhatsApp
-async function sendMessage(jid, text) {
-  if (!sock || connectionStatus !== 'connected') {
-    throw new Error('WhatsApp not connected')
-  }
+// Send text message via WhatsApp (with optional reply)
+async function sendMessage(jid, text, quotedMessageId) {
+  if (!sock || connectionStatus !== 'connected') throw new Error('WhatsApp not connected')
   const formattedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`
-  const result = await sock.sendMessage(formattedJid, { text })
+  const opts = { text }
+  if (quotedMessageId) {
+    // Find the quoted message in store for proper reply context
+    const chat = chatStore[formattedJid]
+    if (chat) {
+      const quotedMsg = chat.messages.find(m => m.messageId === quotedMessageId)
+      if (quotedMsg && quotedMsg._raw) {
+        opts.quoted = quotedMsg._raw
+      }
+    }
+  }
+  const result = await sock.sendMessage(formattedJid, opts)
   return result
 }
 
-// Parse body from request
+// Send media (image, document, video, audio) via WhatsApp
+async function sendMedia(jid, { type, buffer, mimetype, filename, caption, quotedMessageId }) {
+  if (!sock || connectionStatus !== 'connected') throw new Error('WhatsApp not connected')
+  const formattedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`
+  let content = {}
+  if (type === 'image') {
+    content = { image: buffer, mimetype: mimetype || 'image/jpeg', caption }
+  } else if (type === 'video') {
+    content = { video: buffer, mimetype: mimetype || 'video/mp4', caption }
+  } else if (type === 'audio') {
+    content = { audio: buffer, mimetype: mimetype || 'audio/ogg; codecs=opus', ptt: true }
+  } else {
+    content = { document: buffer, mimetype: mimetype || 'application/octet-stream', fileName: filename || 'file' }
+  }
+  const opts = quotedMessageId ? { quoted: chatStore[formattedJid]?.messages.find(m => m.messageId === quotedMessageId)?._raw } : undefined
+  const result = await sock.sendMessage(formattedJid, content, opts ? { quoted: opts.quoted } : undefined)
+  return result
+}
+
+// Edit a sent message
+async function editMessage(jid, messageId, newText) {
+  if (!sock || connectionStatus !== 'connected') throw new Error('WhatsApp not connected')
+  const formattedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`
+  const key = { remoteJid: formattedJid, fromMe: true, id: messageId }
+  const result = await sock.sendMessage(formattedJid, { text: newText, edit: key })
+  // Update in store
+  if (chatStore[formattedJid]) {
+    const msg = chatStore[formattedJid].messages.find(m => m.messageId === messageId)
+    if (msg) { msg.body = newText; msg.edited = true }
+  }
+  return result
+}
+
+// Parse JSON body from request
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = ''
@@ -59,6 +101,16 @@ function parseBody(req) {
     req.on('end', () => {
       try { resolve(JSON.parse(body)) } catch { resolve({}) }
     })
+    req.on('error', reject)
+  })
+}
+
+// Parse raw body as Buffer for media uploads
+function parseRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', chunk => chunks.push(chunk))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
     req.on('error', reject)
   })
 }
@@ -71,7 +123,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
 const chatStore = {}
 const MAX_MESSAGES_PER_CHAT = 200
 
-function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp }) {
+function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp, mediaType, quotedMessageId, quotedBody, _raw }) {
   const phone = jid.split('@')[0]
   if (!chatStore[jid]) {
     chatStore[jid] = { jid, phone, pushName: pushName || phone, lastMessage: '', lastMessageAt: new Date().toISOString(), unreadCount: 0, messages: [] }
@@ -83,7 +135,8 @@ function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp }) {
   // Check duplicate
   if (messageId && chat.messages.some(m => m.messageId === messageId)) return chat
 
-  const msg = { messageId, fromMe: !!fromMe, body: body || '', timestamp: ts }
+  const msg = { messageId, fromMe: !!fromMe, body: body || '', timestamp: ts, mediaType: mediaType || null, quotedMessageId: quotedMessageId || null, quotedBody: quotedBody || null, edited: false }
+  if (_raw) msg._raw = _raw // store raw baileys message for reply context
   chat.messages.push(msg)
   if (chat.messages.length > MAX_MESSAGES_PER_CHAT) chat.messages = chat.messages.slice(-MAX_MESSAGES_PER_CHAT)
   
@@ -102,7 +155,7 @@ function getChats() {
 }
 
 function getChatMessages(jid) {
-  return chatStore[jid]?.messages || []
+  return (chatStore[jid]?.messages || []).map(({ _raw, ...msg }) => msg)
 }
 
 function markChatRead(jid) {
@@ -257,15 +310,36 @@ async function startWhatsApp() {
           const body = text || (mediaType ? `[${mediaType}]` : '')
           const timestamp = msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000).toISOString() : new Date().toISOString()
 
-          // Store in memory
-          upsertChat(jid, { pushName, body, fromMe, messageId: msg.key.id, timestamp })
+          // Extract reply context
+          const contextInfo = msg.message?.extendedTextMessage?.contextInfo || msg.message?.imageMessage?.contextInfo || msg.message?.videoMessage?.contextInfo || null
+          const quotedMessageId = contextInfo?.stanzaId || null
+          const quotedBody = contextInfo?.quotedMessage?.conversation || contextInfo?.quotedMessage?.extendedTextMessage?.text || null
+
+          // Store in memory (keep _raw for reply chaining)
+          upsertChat(jid, { pushName, body, fromMe, messageId: msg.key.id, timestamp, mediaType, quotedMessageId, quotedBody, _raw: msg })
 
           console.log(`[Bridge] ${fromMe ? 'Sent' : 'Received'} ${jid}: ${body || '[empty]'}`)
 
           sendWebhook('message', {
             messageId: msg.key.id, jid, fromMe, pushName,
-            body, mediaType, phone: jid.split('@')[0],
+            body, mediaType, phone: jid.split('@')[0], quotedMessageId, quotedBody,
           })
+        }
+      }
+    })
+
+    // Listen for message updates (edits, deletes, etc.)
+    sock.ev.on('messages.update', (updates) => {
+      for (const update of updates) {
+        const jid = update.key?.remoteJid
+        if (!jid || !chatStore[jid]) continue
+        // Handle message edit
+        if (update.update?.message) {
+          const editedText = update.update.message?.conversation || update.update.message?.extendedTextMessage?.text
+          if (editedText) {
+            const msg = chatStore[jid].messages.find(m => m.messageId === update.key.id)
+            if (msg) { msg.body = editedText; msg.edited = true }
+          }
         }
       }
     })
@@ -367,7 +441,7 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // POST /send - Send a message
+  // POST /send - Send a text message (with optional reply)
   if (req.method === 'POST' && url.pathname === '/send') {
     try {
       const body = await parseBody(req)
@@ -376,9 +450,56 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'Missing jid or text' }))
         return
       }
-      const result = await sendMessage(body.jid, body.text)
+      const result = await sendMessage(body.jid, body.text, body.quotedMessageId)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ status: 'sent', messageId: result.key.id }))
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: err.message }))
+    }
+    return
+  }
+
+  // POST /send-media - Send media (file, image, audio)
+  // Expects JSON: { jid, type: 'image'|'video'|'audio'|'document', base64, mimetype, filename, caption, quotedMessageId }
+  if (req.method === 'POST' && url.pathname === '/send-media') {
+    try {
+      const body = await parseBody(req)
+      if (!body.jid || !body.type || !body.base64) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Missing jid, type, or base64' }))
+        return
+      }
+      const buffer = Buffer.from(body.base64, 'base64')
+      const result = await sendMedia(body.jid, {
+        type: body.type,
+        buffer,
+        mimetype: body.mimetype,
+        filename: body.filename,
+        caption: body.caption,
+        quotedMessageId: body.quotedMessageId,
+      })
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ status: 'sent', messageId: result.key.id }))
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: err.message }))
+    }
+    return
+  }
+
+  // POST /edit-message - Edit a sent message
+  if (req.method === 'POST' && url.pathname === '/edit-message') {
+    try {
+      const body = await parseBody(req)
+      if (!body.jid || !body.messageId || !body.text) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Missing jid, messageId, or text' }))
+        return
+      }
+      await editMessage(body.jid, body.messageId, body.text)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ status: 'edited' }))
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: err.message }))
