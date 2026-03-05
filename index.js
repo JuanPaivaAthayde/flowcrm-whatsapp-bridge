@@ -107,6 +107,7 @@ async function sendMedia(jid, { type, buffer, mimetype, filename, caption, quote
     console.log('[Bridge] Converting audio to ogg/opus...')
     const convertedBuffer = await convertToOggOpus(buffer)
     console.log('[Bridge] Audio converted, size:', convertedBuffer.length)
+    buffer = convertedBuffer // use converted for both sending and storing
     content = { audio: convertedBuffer, mimetype: 'audio/ogg; codecs=opus', ptt: true }
   } else {
     content = { document: buffer, mimetype: mimetype || 'application/octet-stream', fileName: filename || 'file' }
@@ -123,6 +124,14 @@ async function sendMedia(jid, { type, buffer, mimetype, filename, caption, quote
     }
   }
   const result = await sock.sendMessage(formattedJid, content, Object.keys(options).length > 0 ? options : undefined)
+  
+  // Store sent media in mediaStore so it can be viewed in CRM
+  if (result?.key?.id && buffer) {
+    const keys = Object.keys(mediaStore)
+    if (keys.length >= MAX_MEDIA_ITEMS) delete mediaStore[keys[0]]
+    mediaStore[result.key.id] = { buffer, mimetype: mimetype || content.mimetype || 'application/octet-stream' }
+    console.log(`[Bridge] Sent media stored: ${result.key.id}`)
+  }
   return result
 }
 
@@ -169,6 +178,72 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
 const chatStore = {}
 const MAX_MESSAGES_PER_CHAT = 200
 
+// Media store: { [messageId]: { buffer: Buffer, mimetype: string } }
+const mediaStore = {}
+const MAX_MEDIA_ITEMS = 500
+
+async function downloadAndStoreMedia(msg) {
+  try {
+    const baileys = await import('@whiskeysockets/baileys')
+    const downloadContentFromMessage = baileys.downloadContentFromMessage || baileys.default?.downloadContentFromMessage
+    
+    const audioMsg = msg.message?.audioMessage
+    const imageMsg = msg.message?.imageMessage
+    const videoMsg = msg.message?.videoMessage
+    const docMsg = msg.message?.documentMessage
+    const stickerMsg = msg.message?.stickerMessage
+
+    // Determine media message and type
+    const mediaMsg = audioMsg || imageMsg || videoMsg || docMsg || stickerMsg
+    if (!mediaMsg) { console.log('[Bridge] No media message found in:', msg.key.id); return null }
+
+    const mediaType = audioMsg ? 'audio' : imageMsg ? 'image' : videoMsg ? 'video' : docMsg ? 'document' : 'sticker'
+    const mimetype = mediaMsg.mimetype || 'application/octet-stream'
+    const msgId = msg.key.id
+
+    console.log(`[Bridge] Downloading media ${msgId} (${mediaType}, ${mimetype})...`)
+
+    // Try downloadContentFromMessage first (more reliable)
+    if (downloadContentFromMessage) {
+      try {
+        const dlType = audioMsg ? (mediaMsg.ptt ? 'ptt' : 'audio') : mediaType
+        const stream = await downloadContentFromMessage(mediaMsg, dlType)
+        const chunks = []
+        for await (const chunk of stream) { chunks.push(chunk) }
+        const buffer = Buffer.concat(chunks)
+        if (buffer.length > 0) {
+          const keys = Object.keys(mediaStore)
+          if (keys.length >= MAX_MEDIA_ITEMS) delete mediaStore[keys[0]]
+          mediaStore[msgId] = { buffer, mimetype }
+          console.log(`[Bridge] Media stored via stream: ${msgId} (${mimetype}, ${buffer.length} bytes)`)
+          return msgId
+        }
+      } catch (streamErr) {
+        console.log('[Bridge] downloadContentFromMessage failed:', streamErr.message)
+      }
+    }
+
+    // Fallback: try downloadMediaMessage
+    const downloadMediaMessage = baileys.downloadMediaMessage || baileys.default?.downloadMediaMessage
+    if (downloadMediaMessage) {
+      const buffer = await downloadMediaMessage(msg, 'buffer', {})
+      if (buffer && buffer.length > 0) {
+        const keys = Object.keys(mediaStore)
+        if (keys.length >= MAX_MEDIA_ITEMS) delete mediaStore[keys[0]]
+        mediaStore[msgId] = { buffer, mimetype }
+        console.log(`[Bridge] Media stored via download: ${msgId} (${mimetype}, ${buffer.length} bytes)`)
+        return msgId
+      }
+    }
+
+    console.log('[Bridge] Both download methods failed for:', msgId)
+    return null
+  } catch (err) {
+    console.error('[Bridge] Media download failed:', err.message)
+    return null
+  }
+}
+
 // Profile picture cache { [jid]: { url: string | null, fetchedAt: number } }
 const profilePicCache = {}
 const PROFILE_PIC_TTL = 1000 * 60 * 60 // 1 hour cache
@@ -189,7 +264,7 @@ async function getProfilePicUrl(jid) {
   }
 }
 
-function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp, mediaType, quotedMessageId, quotedBody, _raw }) {
+function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp, mediaType, quotedMessageId, quotedBody, _raw, hasMedia }) {
   const phone = jid.split('@')[0]
   if (!chatStore[jid]) {
     chatStore[jid] = { jid, phone, pushName: pushName || phone, lastMessage: '', lastMessageAt: new Date().toISOString(), unreadCount: 0, messages: [] }
@@ -201,7 +276,7 @@ function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp, mediaTy
   // Check duplicate
   if (messageId && chat.messages.some(m => m.messageId === messageId)) return chat
 
-  const msg = { messageId, fromMe: !!fromMe, body: body || '', timestamp: ts, mediaType: mediaType || null, quotedMessageId: quotedMessageId || null, quotedBody: quotedBody || null, edited: false }
+  const msg = { messageId, fromMe: !!fromMe, body: body || '', timestamp: ts, mediaType: mediaType || null, quotedMessageId: quotedMessageId || null, quotedBody: quotedBody || null, edited: false, hasMedia: !!hasMedia }
   if (_raw) msg._raw = _raw // store raw baileys message for reply context
   chat.messages.push(msg)
   if (chat.messages.length > MAX_MESSAGES_PER_CHAT) chat.messages = chat.messages.slice(-MAX_MESSAGES_PER_CHAT)
@@ -234,7 +309,10 @@ async function fetchAllProfilePics() {
 }
 
 function getChatMessages(jid) {
-  return (chatStore[jid]?.messages || []).map(({ _raw, ...msg }) => msg)
+  return (chatStore[jid]?.messages || []).map(({ _raw, ...msg }) => ({
+    ...msg,
+    mediaAvailable: msg.hasMedia && !!mediaStore[msg.messageId],
+  }))
 }
 
 function markChatRead(jid) {
@@ -395,7 +473,13 @@ async function startWhatsApp() {
           const quotedBody = contextInfo?.quotedMessage?.conversation || contextInfo?.quotedMessage?.extendedTextMessage?.text || null
 
           // Store in memory (keep _raw for reply chaining)
-          upsertChat(jid, { pushName, body, fromMe, messageId: msg.key.id, timestamp, mediaType, quotedMessageId, quotedBody, _raw: msg })
+          const hasMedia = !!(msg.message?.audioMessage || msg.message?.imageMessage || msg.message?.videoMessage || msg.message?.documentMessage)
+          upsertChat(jid, { pushName, body, fromMe, messageId: msg.key.id, timestamp, mediaType, quotedMessageId, quotedBody, _raw: msg, hasMedia })
+
+          // Download and store media in background
+          if (hasMedia) {
+            downloadAndStoreMedia(msg).catch(() => {})
+          }
 
           console.log(`[Bridge] ${fromMe ? 'Sent' : 'Received'} ${jid}: ${body || '[empty]'}`)
 
@@ -437,7 +521,10 @@ async function startWhatsApp() {
             || ''
           const fromMe = msg.key?.fromMe || false
           const timestamp = msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000).toISOString() : new Date().toISOString()
-          upsertChat(jid, { pushName: msg.pushName || null, body: text, fromMe, messageId: msg.key?.id, timestamp })
+          const mediaType = msg.message?.imageMessage ? 'image' : msg.message?.videoMessage ? 'video' : msg.message?.audioMessage ? 'audio' : msg.message?.documentMessage ? 'document' : null
+          const hasMedia = !!mediaType
+          upsertChat(jid, { pushName: msg.pushName || null, body: text || (mediaType ? `[${mediaType}]` : ''), fromMe, messageId: msg.key?.id, timestamp, mediaType, hasMedia, _raw: msg })
+          if (hasMedia) downloadAndStoreMedia(msg).catch(() => {})
         }
       }
       console.log(`[Bridge] Store now has ${Object.keys(chatStore).length} chats`)
@@ -585,6 +672,29 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: err.message }))
     }
+    return
+  }
+
+  // GET /media?messageId=xxx - Serve stored media content
+  if (req.method === 'GET' && url.pathname === '/media') {
+    const messageId = url.searchParams.get('messageId')
+    if (!messageId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Missing messageId parameter' }))
+      return
+    }
+    const media = mediaStore[messageId]
+    if (!media) {
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Media not found' }))
+      return
+    }
+    res.writeHead(200, {
+      'Content-Type': media.mimetype,
+      'Content-Length': media.buffer.length,
+      'Cache-Control': 'public, max-age=86400',
+    })
+    res.end(media.buffer)
     return
   }
 
