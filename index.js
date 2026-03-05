@@ -66,6 +66,49 @@ function parseBody(req) {
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
 
+// In-memory chat store
+// chats: { [jid]: { jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messages: [...] } }
+const chatStore = {}
+const MAX_MESSAGES_PER_CHAT = 200
+
+function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp }) {
+  const phone = jid.split('@')[0]
+  if (!chatStore[jid]) {
+    chatStore[jid] = { jid, phone, pushName: pushName || phone, lastMessage: '', lastMessageAt: new Date().toISOString(), unreadCount: 0, messages: [] }
+  }
+  const chat = chatStore[jid]
+  if (pushName && pushName !== phone) chat.pushName = pushName
+  const ts = timestamp || new Date().toISOString()
+  
+  // Check duplicate
+  if (messageId && chat.messages.some(m => m.messageId === messageId)) return chat
+
+  const msg = { messageId, fromMe: !!fromMe, body: body || '', timestamp: ts }
+  chat.messages.push(msg)
+  if (chat.messages.length > MAX_MESSAGES_PER_CHAT) chat.messages = chat.messages.slice(-MAX_MESSAGES_PER_CHAT)
+  
+  chat.lastMessage = body || ''
+  chat.lastMessageAt = ts
+  if (!fromMe) chat.unreadCount = (chat.unreadCount || 0) + 1
+  return chat
+}
+
+function getChats() {
+  return Object.values(chatStore)
+    .sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime())
+    .map(({ jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messages }) => ({
+      jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messageCount: messages.length
+    }))
+}
+
+function getChatMessages(jid) {
+  return chatStore[jid]?.messages || []
+}
+
+function markChatRead(jid) {
+  if (chatStore[jid]) chatStore[jid].unreadCount = 0
+}
+
 // State
 let sock = null
 let currentQR = null
@@ -190,12 +233,11 @@ async function startWhatsApp() {
       }
     })
 
-    // Listen for incoming messages and forward to CRM via webhook
+    // Listen for incoming messages - store locally + forward via webhook
     sock.ev.on('messages.upsert', (m) => {
-      if (m.type === 'notify') {
+      if (m.type === 'notify' || m.type === 'append') {
         for (const msg of m.messages) {
           const jid = msg.key.remoteJid
-          // Skip status broadcasts and groups for now
           if (!jid || jid === 'status@broadcast' || jid.endsWith('@g.us')) continue
 
           const text = msg.message?.conversation
@@ -212,20 +254,40 @@ async function startWhatsApp() {
 
           const pushName = msg.pushName || null
           const fromMe = msg.key.fromMe || false
+          const body = text || (mediaType ? `[${mediaType}]` : '')
+          const timestamp = msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000).toISOString() : new Date().toISOString()
 
-          console.log(`[Bridge] ${fromMe ? 'Sent' : 'Received'} ${jid}: ${text || '[media]'}`)
+          // Store in memory
+          upsertChat(jid, { pushName, body, fromMe, messageId: msg.key.id, timestamp })
+
+          console.log(`[Bridge] ${fromMe ? 'Sent' : 'Received'} ${jid}: ${body || '[empty]'}`)
 
           sendWebhook('message', {
-            messageId: msg.key.id,
-            jid,
-            fromMe,
-            pushName,
-            body: text || (mediaType ? `[${mediaType}]` : ''),
-            mediaType,
-            phone: jid.split('@')[0],
+            messageId: msg.key.id, jid, fromMe, pushName,
+            body, mediaType, phone: jid.split('@')[0],
           })
         }
       }
+    })
+
+    // Listen for history sync (existing chats when connecting)
+    sock.ev.on('messaging-history.set', ({ chats: syncedChats, messages: syncedMessages }) => {
+      console.log(`[Bridge] History sync: ${syncedChats?.length || 0} chats, ${syncedMessages?.length || 0} messages`)
+      if (syncedMessages) {
+        for (const msg of syncedMessages) {
+          const jid = msg.key?.remoteJid
+          if (!jid || jid === 'status@broadcast' || jid.endsWith('@g.us')) continue
+          const text = msg.message?.conversation
+            || msg.message?.extendedTextMessage?.text
+            || msg.message?.imageMessage?.caption
+            || msg.message?.videoMessage?.caption
+            || ''
+          const fromMe = msg.key?.fromMe || false
+          const timestamp = msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000).toISOString() : new Date().toISOString()
+          upsertChat(jid, { pushName: msg.pushName || null, body: text, fromMe, messageId: msg.key?.id, timestamp })
+        }
+      }
+      console.log(`[Bridge] Store now has ${Object.keys(chatStore).length} chats`)
     })
 
   } catch (err) {
@@ -321,6 +383,28 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: err.message }))
     }
+    return
+  }
+
+  // GET /chats - List all chats with last message
+  if (req.method === 'GET' && url.pathname === '/chats') {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ chats: getChats() }))
+    return
+  }
+
+  // GET /messages?jid=xxx - Get messages for a specific chat
+  if (req.method === 'GET' && url.pathname === '/messages') {
+    const jid = url.searchParams.get('jid')
+    if (!jid) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Missing jid parameter' }))
+      return
+    }
+    // Mark as read when fetching messages
+    markChatRead(jid)
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ jid, messages: getChatMessages(jid) }))
     return
   }
 
