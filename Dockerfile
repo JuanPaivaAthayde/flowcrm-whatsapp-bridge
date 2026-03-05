@@ -9,6 +9,8 @@ RUN npm install --production
 
 COPY . .
 
+ENV DATA_DIR=/data
+
 EXPOSE 3001
 
 CMD ["node", "index.js"]
