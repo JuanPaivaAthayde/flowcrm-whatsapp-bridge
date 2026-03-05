@@ -17,6 +17,39 @@
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
+const { execFile } = require('child_process')
+
+// Convert audio buffer (webm/any) to ogg opus using ffmpeg
+function convertToOggOpus(inputBuffer) {
+  return new Promise((resolve, reject) => {
+    const tmpInput = path.join(require('os').tmpdir(), `wa_in_${Date.now()}.webm`)
+    const tmpOutput = path.join(require('os').tmpdir(), `wa_out_${Date.now()}.ogg`)
+    fs.writeFileSync(tmpInput, inputBuffer)
+    execFile('ffmpeg', [
+      '-i', tmpInput,
+      '-ar', '48000', '-ac', '1',
+      '-c:a', 'libopus', '-b:a', '64k',
+      '-application', 'voip',
+      '-f', 'ogg', '-y', tmpOutput
+    ], (err) => {
+      try { fs.unlinkSync(tmpInput) } catch {}
+      if (err) {
+        try { fs.unlinkSync(tmpOutput) } catch {}
+        console.error('[Bridge] ffmpeg error:', err.message)
+        // Fallback: send original buffer as-is
+        resolve(inputBuffer)
+        return
+      }
+      try {
+        const outputBuffer = fs.readFileSync(tmpOutput)
+        fs.unlinkSync(tmpOutput)
+        resolve(outputBuffer)
+      } catch (readErr) {
+        reject(readErr)
+      }
+    })
+  })
+}
 
 const PORT = process.env.PORT || 3001
 const WEBHOOK_URL = process.env.WEBHOOK_URL || null
@@ -45,18 +78,18 @@ async function sendWebhook(event, data) {
 async function sendMessage(jid, text, quotedMessageId) {
   if (!sock || connectionStatus !== 'connected') throw new Error('WhatsApp not connected')
   const formattedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`
-  const opts = { text }
+  const content = { text }
+  const options = {}
   if (quotedMessageId) {
-    // Find the quoted message in store for proper reply context
     const chat = chatStore[formattedJid]
     if (chat) {
       const quotedMsg = chat.messages.find(m => m.messageId === quotedMessageId)
       if (quotedMsg && quotedMsg._raw) {
-        opts.quoted = quotedMsg._raw
+        options.quoted = quotedMsg._raw
       }
     }
   }
-  const result = await sock.sendMessage(formattedJid, opts)
+  const result = await sock.sendMessage(formattedJid, content, Object.keys(options).length > 0 ? options : undefined)
   return result
 }
 
@@ -70,12 +103,26 @@ async function sendMedia(jid, { type, buffer, mimetype, filename, caption, quote
   } else if (type === 'video') {
     content = { video: buffer, mimetype: mimetype || 'video/mp4', caption }
   } else if (type === 'audio') {
-    content = { audio: buffer, mimetype: mimetype || 'audio/ogg; codecs=opus', ptt: true }
+    // Convert to ogg/opus using ffmpeg for WhatsApp compatibility
+    console.log('[Bridge] Converting audio to ogg/opus...')
+    const convertedBuffer = await convertToOggOpus(buffer)
+    console.log('[Bridge] Audio converted, size:', convertedBuffer.length)
+    content = { audio: convertedBuffer, mimetype: 'audio/ogg; codecs=opus', ptt: true }
   } else {
     content = { document: buffer, mimetype: mimetype || 'application/octet-stream', fileName: filename || 'file' }
   }
-  const opts = quotedMessageId ? { quoted: chatStore[formattedJid]?.messages.find(m => m.messageId === quotedMessageId)?._raw } : undefined
-  const result = await sock.sendMessage(formattedJid, content, opts ? { quoted: opts.quoted } : undefined)
+  // Build options separately (quoted for reply)
+  const options = {}
+  if (quotedMessageId) {
+    const chat = chatStore[formattedJid]
+    if (chat) {
+      const quotedMsg = chat.messages.find(m => m.messageId === quotedMessageId)
+      if (quotedMsg && quotedMsg._raw) {
+        options.quoted = quotedMsg._raw
+      }
+    }
+  }
+  const result = await sock.sendMessage(formattedJid, content, Object.keys(options).length > 0 ? options : undefined)
   return result
 }
 
@@ -119,9 +166,28 @@ function parseRawBody(req) {
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
 
 // In-memory chat store
-// chats: { [jid]: { jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messages: [...] } }
 const chatStore = {}
 const MAX_MESSAGES_PER_CHAT = 200
+
+// Profile picture cache { [jid]: { url: string | null, fetchedAt: number } }
+const profilePicCache = {}
+const PROFILE_PIC_TTL = 1000 * 60 * 60 // 1 hour cache
+
+async function getProfilePicUrl(jid) {
+  const formattedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`
+  const cached = profilePicCache[formattedJid]
+  if (cached && Date.now() - cached.fetchedAt < PROFILE_PIC_TTL) return cached.url
+  if (!sock || connectionStatus !== 'connected') return null
+  try {
+    const url = await sock.profilePictureUrl(formattedJid, 'image')
+    profilePicCache[formattedJid] = { url, fetchedAt: Date.now() }
+    return url
+  } catch {
+    // No profile pic or privacy settings block it
+    profilePicCache[formattedJid] = { url: null, fetchedAt: Date.now() }
+    return null
+  }
+}
 
 function upsertChat(jid, { pushName, body, fromMe, messageId, timestamp, mediaType, quotedMessageId, quotedBody, _raw }) {
   const phone = jid.split('@')[0]
@@ -150,8 +216,21 @@ function getChats() {
   return Object.values(chatStore)
     .sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime())
     .map(({ jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messages }) => ({
-      jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messageCount: messages.length
+      jid, phone, pushName, lastMessage, lastMessageAt, unreadCount, messageCount: messages.length,
+      profilePicUrl: profilePicCache[jid]?.url || null,
     }))
+}
+
+// Fetch profile pics for all chats in background (non-blocking)
+async function fetchAllProfilePics() {
+  const jids = Object.keys(chatStore)
+  for (const jid of jids) {
+    if (!profilePicCache[jid] || Date.now() - profilePicCache[jid].fetchedAt > PROFILE_PIC_TTL) {
+      await getProfilePicUrl(jid).catch(() => {})
+      // Small delay to avoid rate limiting
+      await new Promise(r => setTimeout(r, 200))
+    }
+  }
 }
 
 function getChatMessages(jid) {
@@ -362,6 +441,8 @@ async function startWhatsApp() {
         }
       }
       console.log(`[Bridge] Store now has ${Object.keys(chatStore).length} chats`)
+      // Fetch profile pics in background after sync
+      setTimeout(() => fetchAllProfilePics(), 2000)
     })
 
   } catch (err) {
@@ -507,7 +588,21 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // GET /chats - List all chats with last message
+  // GET /profile-pic?jid=xxx - Get profile picture URL
+  if (req.method === 'GET' && url.pathname === '/profile-pic') {
+    const jid = url.searchParams.get('jid')
+    if (!jid) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Missing jid parameter' }))
+      return
+    }
+    const picUrl = await getProfilePicUrl(jid)
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ jid, profilePicUrl: picUrl }))
+    return
+  }
+
+  // GET /chats - List all chats with last message (includes profile pics)
   if (req.method === 'GET' && url.pathname === '/chats') {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ chats: getChats() }))
