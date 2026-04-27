@@ -1,17 +1,19 @@
 {
   "name": "flowcrm-whatsapp-bridge",
-  "version": "1.0.0",
-  "description": "FlowCRM WhatsApp Bridge Server - Conecta ao WhatsApp Web via QR Code",
+  "version": "2.0.0",
+  "description": "WhatsApp Bridge for FlowCRM using Baileys v7",
   "main": "index.js",
-  "engines": {
-    "node": ">=18"
-  },
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "pino": "^9.6.0",
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.0",
+    "pino": "^9.4.0",
     "qrcode": "^1.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
