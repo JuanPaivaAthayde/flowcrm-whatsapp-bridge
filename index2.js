@@ -1,470 +1,421 @@
-/**
- * ATUALIZAÇÃO DO BRIDGE - CORREÇÃO LID -> NÚMERO REAL
- * 
- * Este arquivo contém o código atualizado para o bridge do WhatsApp
- * que resolve automaticamente LIDs para números de telefone reais.
- * 
- * INSTRUÇÕES:
- * 1. Acesse o Railway -> flowcrm-whatsapp-bridge
- * 2. Substitua o conteúdo do arquivo index.ts pelo código abaixo
- * 3. Faça deploy
- */
-
-import express from "express"
-import { 
-  makeWASocket, 
+import makeWASocket, { 
   DisconnectReason, 
   useMultiFileAuthState,
-  WASocket,
-  BaileysEventMap,
-  proto,
-  jidNormalizedUser
-} from "@whiskeysockets/baileys"
-import { Boom } from "@hapi/boom"
-import QRCode from "qrcode"
-import pino from "pino"
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore
+} from '@whiskeysockets/baileys';
+import express from 'express';
+import { toDataURL } from 'qrcode';
+import pino from 'pino';
 
-const app = express()
-app.use(express.json())
+const app = express();
+app.use(express.json());
 
-let sock: WASocket | null = null
-let qrCode: string | null = null
-let connectionStatus: "disconnected" | "connecting" | "connected" = "disconnected"
+const PORT = process.env.PORT || 3001;
 
-// NOVO: Mapeamento LID -> Número Real
-const lidToPhoneMap = new Map<string, string>()
+// Logger
+const logger = pino({ level: 'silent' });
 
-// Mensagens armazenadas em memória
-const chatsMap = new Map<string, {
-  jid: string
-  phone: string
-  realPhone: string  // NOVO: Número real
-  pushName: string
-  lastMessage: string
-  lastMessageAt: Date
-  unreadCount: number
-  messages: Array<{
-    id: string
-    body: string
-    fromMe: boolean
-    timestamp: Date
-    pushName?: string
-    quotedMessage?: { body: string; fromMe: boolean } | null
-  }>
-  profilePicUrl?: string | null
-}>()
+// State
+let sock = null;
+let qrCode = null;
+let connectionStatus = 'disconnected';
+let lastDisconnectReason = null;
 
-// NOVO: Função para extrair número real do JID ou LID
-function extractRealPhone(jid: string, message?: proto.IWebMessageInfo): string {
-  // Remove sufixo @s.whatsapp.net ou @lid
-  const baseId = jid.split("@")[0]
-  
-  // Se é um LID, tenta resolver para número real
-  if (jid.includes("@lid")) {
-    // Verifica se já temos no mapa
-    if (lidToPhoneMap.has(jid)) {
-      return lidToPhoneMap.get(jid)!
-    }
-    
-    // Tenta extrair do remoteJidAlt da mensagem (Baileys v7+)
-    if (message?.key?.remoteJidAlt) {
-      const realJid = message.key.remoteJidAlt
-      const realPhone = realJid.split("@")[0]
-      lidToPhoneMap.set(jid, realPhone)
-      console.log(`[LID Resolver] Mapped ${jid} -> ${realPhone}`)
-      return realPhone
-    }
-    
-    // Tenta extrair do participantAlt
-    if (message?.key?.participantAlt) {
-      const realPhone = message.key.participantAlt.split("@")[0]
-      lidToPhoneMap.set(jid, realPhone)
-      console.log(`[LID Resolver] Mapped ${jid} -> ${realPhone} (via participantAlt)`)
-      return realPhone
-    }
-    
-    // Se não conseguiu resolver, retorna o LID mesmo
-    return baseId
-  }
-  
-  return baseId
+// Store for chats and messages
+const chats = new Map();
+const messageStore = new Map();
+
+// LID to Phone mapping - KEY FEATURE for resolving real phone numbers
+const lidToPhoneMap = new Map();
+
+// Helper to extract phone from JID
+function jidToPhone(jid) {
+  if (!jid) return null;
+  return jid.split('@')[0];
 }
 
-// NOVO: Função para atualizar mapeamento LID a partir de uma mensagem
-function updateLidMapping(message: proto.IWebMessageInfo) {
-  const jid = message.key?.remoteJid
-  if (!jid || !jid.includes("@lid")) return
+// Helper to check if JID is a LID
+function isLidJid(jid) {
+  return jid && jid.includes('@lid');
+}
+
+// Get real phone number from JID (resolves LID if possible)
+function getRealPhone(jid) {
+  if (!jid) return null;
   
-  // remoteJidAlt contém o JID real (número@s.whatsapp.net)
-  if (message.key?.remoteJidAlt) {
-    const realPhone = message.key.remoteJidAlt.split("@")[0]
-    if (!lidToPhoneMap.has(jid)) {
-      lidToPhoneMap.set(jid, realPhone)
-      console.log(`[LID Resolver] New mapping: ${jid} -> ${realPhone}`)
-      
-      // Atualiza o chat existente se houver
-      const chat = chatsMap.get(jid)
-      if (chat) {
-        chat.realPhone = realPhone
-        chat.phone = realPhone
-      }
+  // If it's a LID, try to get the real phone from our map
+  if (isLidJid(jid)) {
+    const realPhone = lidToPhoneMap.get(jid);
+    if (realPhone) return realPhone;
+    // Fallback to extracting from LID (not the real number but better than nothing)
+    return jidToPhone(jid);
+  }
+  
+  // Regular JID - extract phone directly
+  return jidToPhone(jid);
+}
+
+// Store LID mapping when we discover it
+function storeLidMapping(lidJid, realJid) {
+  if (lidJid && realJid && isLidJid(lidJid) && !isLidJid(realJid)) {
+    const realPhone = jidToPhone(realJid);
+    if (realPhone) {
+      lidToPhoneMap.set(lidJid, realPhone);
+      console.log(`[LID Mapping] ${lidJid} -> ${realPhone}`);
     }
   }
 }
 
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info")
-  
-  connectionStatus = "connecting"
-  
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: "silent" }),
-    browser: ["FlowCRM", "Chrome", "1.0.0"],
-    // NOVO: Habilitar sincronização de contatos para resolver LIDs
-    syncFullHistory: false,
-  })
-  
-  sock.ev.on("creds.update", saveCreds)
-  
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update
-    
-    if (qr) {
-      qrCode = await QRCode.toDataURL(qr)
-      connectionStatus = "connecting"
-    }
-    
-    if (connection === "close") {
-      connectionStatus = "disconnected"
-      qrCode = null
-      const reason = (lastDisconnect?.error as Boom)?.output?.statusCode
-      
-      if (reason !== DisconnectReason.loggedOut) {
-        setTimeout(connectToWhatsApp, 3000)
-      }
-    } else if (connection === "open") {
-      connectionStatus = "connected"
-      qrCode = null
-      console.log("[WhatsApp] Connected successfully")
-      
-      // NOVO: Sincroniza contatos para resolver LIDs existentes
-      await syncContactsForLidResolution()
-    }
-  })
-  
-  // NOVO: Listener para contacts.update - ajuda a resolver LIDs
-  sock.ev.on("contacts.update", (contacts) => {
-    for (const contact of contacts) {
-      if (contact.id && contact.id.includes("@lid")) {
-        // Verifica se temos o número real em algum campo
-        const notify = (contact as any).notify
-        const verifiedName = (contact as any).verifiedName
-        const name = contact.name
-        
-        console.log(`[Contact Update] ${contact.id}:`, { notify, verifiedName, name })
-      }
-    }
-  })
-  
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    for (const message of messages) {
-      // NOVO: Atualiza mapeamento LID
-      updateLidMapping(message)
-      
-      const jid = message.key.remoteJid
-      if (!jid || jid === "status@broadcast") continue
-      
-      // Extrai número real usando a nova função
-      const realPhone = extractRealPhone(jid, message)
-      const basePhone = jid.split("@")[0]
-      
-      const isFromMe = message.key.fromMe || false
-      const pushName = message.pushName || "Desconhecido"
-      
-      // Extrai o corpo da mensagem
-      let body = ""
-      const msgContent = message.message
-      if (msgContent) {
-        body = msgContent.conversation ||
-               msgContent.extendedTextMessage?.text ||
-               msgContent.imageMessage?.caption ||
-               msgContent.videoMessage?.caption ||
-               msgContent.documentMessage?.caption ||
-               (msgContent.audioMessage ? "[Áudio]" : "") ||
-               (msgContent.stickerMessage ? "[Sticker]" : "") ||
-               (msgContent.contactMessage ? "[Contato]" : "") ||
-               (msgContent.locationMessage ? "[Localização]" : "") ||
-               ""
-      }
-      
-      // Quoted message
-      let quotedMessage = null
-      const contextInfo = msgContent?.extendedTextMessage?.contextInfo
-      if (contextInfo?.quotedMessage) {
-        const quoted = contextInfo.quotedMessage
-        quotedMessage = {
-          body: quoted.conversation || 
-                quoted.extendedTextMessage?.text || 
-                "[Mídia]",
-          fromMe: contextInfo.participant === sock?.user?.id
-        }
-      }
-      
-      // Busca ou cria o chat
-      let chat = chatsMap.get(jid)
-      if (!chat) {
-        // Tenta buscar foto do perfil
-        let profilePicUrl: string | null = null
-        try {
-          profilePicUrl = await sock?.profilePictureUrl(jid, "preview") || null
-        } catch { }
-        
-        chat = {
-          jid,
-          phone: realPhone,      // ATUALIZADO: Usa número real
-          realPhone: realPhone,  // NOVO: Armazena número real
-          pushName,
-          lastMessage: body,
-          lastMessageAt: new Date(Number(message.messageTimestamp) * 1000),
-          unreadCount: isFromMe ? 0 : 1,
-          messages: [],
-          profilePicUrl
-        }
-        chatsMap.set(jid, chat)
-      } else {
-        // Atualiza chat existente
-        chat.lastMessage = body || chat.lastMessage
-        chat.lastMessageAt = new Date(Number(message.messageTimestamp) * 1000)
-        if (!isFromMe) chat.unreadCount++
-        if (pushName && pushName !== "Desconhecido") chat.pushName = pushName
-        // NOVO: Atualiza número real se disponível
-        if (realPhone && realPhone !== basePhone) {
-          chat.realPhone = realPhone
-          chat.phone = realPhone
-        }
-      }
-      
-      // Adiciona mensagem ao histórico
-      chat.messages.push({
-        id: message.key.id || Date.now().toString(),
-        body,
-        fromMe: isFromMe,
-        timestamp: new Date(Number(message.messageTimestamp) * 1000),
-        pushName: isFromMe ? undefined : pushName,
-        quotedMessage
-      })
-      
-      // Limita a 100 mensagens por chat
-      if (chat.messages.length > 100) {
-        chat.messages = chat.messages.slice(-100)
-      }
-    }
-  })
-}
-
-// NOVO: Função para sincronizar contatos e resolver LIDs
-async function syncContactsForLidResolution() {
-  if (!sock) return
-  
   try {
-    // Busca a store de contatos do Baileys
-    const store = (sock as any).store
-    if (store?.contacts) {
-      for (const [jid, contact] of Object.entries(store.contacts)) {
-        if (jid.includes("@lid") && (contact as any).lid) {
-          const realJid = (contact as any).lid
-          const realPhone = realJid.split("@")[0]
-          lidToPhoneMap.set(jid, realPhone)
-          console.log(`[Store Sync] Mapped ${jid} -> ${realPhone}`)
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+    const { version } = await fetchLatestBaileysVersion();
+    
+    console.log(`Using Baileys version: ${version.join('.')}`);
+
+    sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      printQRInTerminal: false,
+      logger,
+      generateHighQualityLinkPreview: true,
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+    });
+
+    // Connection events
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      
+      if (qr) {
+        qrCode = await toDataURL(qr);
+        connectionStatus = 'waiting_qr';
+        console.log('QR Code generated');
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        lastDisconnectReason = statusCode;
+        connectionStatus = 'disconnected';
+        
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log(`Connection closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
+        
+        if (shouldReconnect) {
+          setTimeout(connectToWhatsApp, 3000);
+        }
+      } else if (connection === 'open') {
+        connectionStatus = 'connected';
+        qrCode = null;
+        console.log('Connected to WhatsApp');
+        
+        // Try to sync contacts to build LID mappings
+        try {
+          const contacts = await sock.store?.contacts || {};
+          for (const [jid, contact] of Object.entries(contacts)) {
+            if (contact.lid) {
+              storeLidMapping(contact.lid, jid);
+            }
+          }
+        } catch (e) {
+          console.log('Could not sync contacts:', e.message);
         }
       }
-    }
+    });
+
+    // Save credentials when updated
+    sock.ev.on('creds.update', saveCreds);
+
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        
+        const jid = msg.key.remoteJid;
+        if (!jid || jid === 'status@broadcast') continue;
+
+        // KEY: Check for remoteJidAlt to get real phone number from LID
+        if (msg.key.remoteJidAlt && isLidJid(jid)) {
+          storeLidMapping(jid, msg.key.remoteJidAlt);
+        }
+        
+        // Also check participant and participantAlt for group messages
+        if (msg.key.participant && msg.key.participantAlt) {
+          storeLidMapping(msg.key.participant, msg.key.participantAlt);
+        }
+
+        // Extract message content
+        const messageContent = msg.message;
+        let body = '';
+        let messageType = 'unknown';
+
+        if (messageContent.conversation) {
+          body = messageContent.conversation;
+          messageType = 'text';
+        } else if (messageContent.extendedTextMessage?.text) {
+          body = messageContent.extendedTextMessage.text;
+          messageType = 'text';
+        } else if (messageContent.imageMessage) {
+          body = messageContent.imageMessage.caption || '[Imagem]';
+          messageType = 'image';
+        } else if (messageContent.videoMessage) {
+          body = messageContent.videoMessage.caption || '[Video]';
+          messageType = 'video';
+        } else if (messageContent.audioMessage) {
+          body = '[Audio]';
+          messageType = 'audio';
+        } else if (messageContent.documentMessage) {
+          body = messageContent.documentMessage.fileName || '[Documento]';
+          messageType = 'document';
+        } else if (messageContent.stickerMessage) {
+          body = '[Sticker]';
+          messageType = 'sticker';
+        } else if (messageContent.contactMessage) {
+          body = '[Contato]';
+          messageType = 'contact';
+        } else if (messageContent.locationMessage) {
+          body = '[Localizacao]';
+          messageType = 'location';
+        }
+
+        // Get real phone number (resolves LID if possible)
+        const realPhone = getRealPhone(jid);
+        const phone = jidToPhone(jid);
+        
+        // Get contact name
+        let pushName = msg.pushName || '';
+        try {
+          const contact = await sock.store?.contacts?.[jid];
+          if (contact?.name) pushName = contact.name;
+          if (contact?.notify) pushName = contact.notify;
+        } catch (e) {}
+
+        // Store message
+        if (!messageStore.has(jid)) {
+          messageStore.set(jid, []);
+        }
+        messageStore.get(jid).push({
+          id: msg.key.id,
+          body,
+          type: messageType,
+          fromMe: msg.key.fromMe || false,
+          timestamp: msg.messageTimestamp,
+          pushName,
+        });
+
+        // Update chat
+        const existingChat = chats.get(jid) || {
+          jid,
+          phone,
+          realPhone: realPhone !== phone ? realPhone : undefined,
+          pushName,
+          unreadCount: 0,
+          messageCount: 0,
+          profilePicUrl: null,
+        };
+
+        existingChat.lastMessage = body;
+        existingChat.lastMessageAt = new Date(msg.messageTimestamp * 1000).toISOString();
+        existingChat.messageCount = (messageStore.get(jid) || []).length;
+        existingChat.pushName = pushName || existingChat.pushName;
+        
+        // Update realPhone if we now have it
+        if (realPhone && realPhone !== phone) {
+          existingChat.realPhone = realPhone;
+        }
+        
+        if (!msg.key.fromMe) {
+          existingChat.unreadCount = (existingChat.unreadCount || 0) + 1;
+        }
+
+        // Try to get profile picture
+        if (!existingChat.profilePicUrl) {
+          try {
+            existingChat.profilePicUrl = await sock.profilePictureUrl(jid, 'image');
+          } catch (e) {
+            existingChat.profilePicUrl = null;
+          }
+        }
+
+        chats.set(jid, existingChat);
+        console.log(`Message from ${pushName || phone}: ${body.substring(0, 50)}...`);
+      }
+    });
+
   } catch (error) {
-    console.error("[Store Sync] Error:", error)
+    console.error('Error connecting:', error);
+    connectionStatus = 'error';
+    setTimeout(connectToWhatsApp, 5000);
   }
 }
 
-// API Endpoints
+// API Routes
 
-app.get("/status", (req, res) => {
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Get connection status and QR code
+app.get('/status', (req, res) => {
   res.json({
     status: connectionStatus,
-    hasQR: !!qrCode,
-    chatsCount: chatsMap.size,
-    lidMappings: lidToPhoneMap.size  // NOVO: Mostra quantos LIDs foram resolvidos
-  })
-})
+    qrCode: connectionStatus === 'waiting_qr' ? qrCode : null,
+    lastDisconnectReason,
+  });
+});
 
-app.get("/qr", (req, res) => {
-  if (qrCode) {
-    res.json({ qr: qrCode })
-  } else if (connectionStatus === "connected") {
-    res.json({ connected: true })
-  } else {
-    res.status(404).json({ error: "QR code not available" })
-  }
-})
-
-app.get("/chats", (req, res) => {
-  const chats = Array.from(chatsMap.values())
-    .map(chat => ({
-      jid: chat.jid,
-      phone: chat.realPhone || chat.phone,  // ATUALIZADO: Prioriza número real
-      realPhone: chat.realPhone,             // NOVO: Inclui número real
-      pushName: chat.pushName,
-      lastMessage: chat.lastMessage,
-      lastMessageAt: chat.lastMessageAt.toISOString(),
-      unreadCount: chat.unreadCount,
-      messageCount: chat.messages.length,
-      profilePicUrl: chat.profilePicUrl
-    }))
-    .sort((a, b) => new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime())
-  
-  res.json(chats)
-})
-
-app.get("/messages/:jid", (req, res) => {
-  const { jid } = req.params
-  const chat = chatsMap.get(jid)
-  
-  if (!chat) {
-    return res.status(404).json({ error: "Chat not found" })
-  }
-  
-  // Marca como lido
-  chat.unreadCount = 0
+// Get all chats with realPhone resolved
+app.get('/chats', (req, res) => {
+  const chatList = Array.from(chats.values())
+    .sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0));
   
   res.json({
-    ...chat,
-    phone: chat.realPhone || chat.phone,  // ATUALIZADO
-    messages: chat.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
-  })
-})
+    success: true,
+    chats: chatList,
+    count: chatList.length,
+  });
+});
 
-app.post("/send", async (req, res) => {
-  const { jid, message, quotedId } = req.body
+// Get messages for a specific chat
+app.get('/messages/:jid', (req, res) => {
+  const { jid } = req.params;
+  const decodedJid = decodeURIComponent(jid);
   
-  if (!sock || connectionStatus !== "connected") {
-    return res.status(503).json({ error: "WhatsApp not connected" })
-  }
+  const messages = messageStore.get(decodedJid) || [];
+  const chat = chats.get(decodedJid);
   
-  try {
-    let options: any = {}
-    
-    if (quotedId) {
-      const chat = chatsMap.get(jid)
-      const quotedMsg = chat?.messages.find(m => m.id === quotedId)
-      if (quotedMsg) {
-        options.quoted = {
-          key: { remoteJid: jid, id: quotedId },
-          message: { conversation: quotedMsg.body }
-        }
-      }
-    }
-    
-    const result = await sock.sendMessage(jid, { text: message }, options)
-    
-    // Adiciona a mensagem enviada ao chat
-    const chat = chatsMap.get(jid)
-    if (chat && result) {
-      chat.messages.push({
-        id: result.key.id || Date.now().toString(),
-        body: message,
-        fromMe: true,
-        timestamp: new Date(),
-        quotedMessage: options.quoted ? { body: options.quoted.message.conversation, fromMe: false } : null
-      })
-      chat.lastMessage = message
-      chat.lastMessageAt = new Date()
-    }
-    
-    res.json({ success: true, messageId: result?.key?.id })
-  } catch (error) {
-    console.error("Error sending message:", error)
-    res.status(500).json({ error: "Failed to send message" })
-  }
-})
-
-app.post("/send-media", async (req, res) => {
-  const { jid, mediaUrl, caption, mediaType } = req.body
-  
-  if (!sock || connectionStatus !== "connected") {
-    return res.status(503).json({ error: "WhatsApp not connected" })
-  }
-  
-  try {
-    const response = await fetch(mediaUrl)
-    const buffer = Buffer.from(await response.arrayBuffer())
-    
-    let messageContent: any
-    
-    if (mediaType === "image") {
-      messageContent = { image: buffer, caption }
-    } else if (mediaType === "video") {
-      messageContent = { video: buffer, caption }
-    } else if (mediaType === "audio") {
-      messageContent = { audio: buffer, mimetype: "audio/mpeg" }
-    } else {
-      messageContent = { 
-        document: buffer, 
-        mimetype: "application/octet-stream",
-        fileName: "file"
-      }
-    }
-    
-    const result = await sock.sendMessage(jid, messageContent)
-    
-    res.json({ success: true, messageId: result?.key?.id })
-  } catch (error) {
-    console.error("Error sending media:", error)
-    res.status(500).json({ error: "Failed to send media" })
-  }
-})
-
-// NOVO: Endpoint para obter mapeamentos LID
-app.get("/lid-mappings", (req, res) => {
-  const mappings: Record<string, string> = {}
-  lidToPhoneMap.forEach((phone, lid) => {
-    mappings[lid] = phone
-  })
-  res.json(mappings)
-})
-
-// NOVO: Endpoint para resolver LID manualmente
-app.post("/resolve-lid", async (req, res) => {
-  const { lid, realPhone } = req.body
-  
-  if (!lid || !realPhone) {
-    return res.status(400).json({ error: "lid and realPhone are required" })
-  }
-  
-  lidToPhoneMap.set(lid, realPhone)
-  
-  // Atualiza o chat se existir
-  const chat = chatsMap.get(lid)
+  // Mark as read
   if (chat) {
-    chat.realPhone = realPhone
-    chat.phone = realPhone
+    chat.unreadCount = 0;
+    chats.set(decodedJid, chat);
   }
   
-  res.json({ success: true, message: `Mapped ${lid} -> ${realPhone}` })
-})
+  res.json({
+    success: true,
+    messages: messages.sort((a, b) => a.timestamp - b.timestamp),
+    chat,
+  });
+});
 
-app.post("/logout", async (req, res) => {
-  if (sock) {
-    await sock.logout()
-    chatsMap.clear()
-    lidToPhoneMap.clear()  // NOVO: Limpa mapeamentos
-    qrCode = null
-    connectionStatus = "disconnected"
+// Send message
+app.post('/send', async (req, res) => {
+  const { jid, message, mediaUrl, mediaType } = req.body;
+  
+  if (!sock || connectionStatus !== 'connected') {
+    return res.status(503).json({ success: false, error: 'WhatsApp not connected' });
   }
-  res.json({ success: true })
-})
+  
+  if (!jid || (!message && !mediaUrl)) {
+    return res.status(400).json({ success: false, error: 'Missing jid or message/mediaUrl' });
+  }
 
-const PORT = process.env.PORT || 3001
-app.listen(PORT, () => {
-  console.log(`Bridge running on port ${PORT}`)
-  connectToWhatsApp()
-})
+  try {
+    let sentMsg;
+    
+    if (mediaUrl) {
+      // Send media message
+      const mediaContent = {
+        [mediaType || 'image']: { url: mediaUrl },
+        caption: message || '',
+      };
+      sentMsg = await sock.sendMessage(jid, mediaContent);
+    } else {
+      // Send text message
+      sentMsg = await sock.sendMessage(jid, { text: message });
+    }
+
+    // Store sent message
+    if (!messageStore.has(jid)) {
+      messageStore.set(jid, []);
+    }
+    messageStore.get(jid).push({
+      id: sentMsg.key.id,
+      body: message,
+      type: 'text',
+      fromMe: true,
+      timestamp: Math.floor(Date.now() / 1000),
+    });
+
+    // Update chat
+    const chat = chats.get(jid);
+    if (chat) {
+      chat.lastMessage = message;
+      chat.lastMessageAt = new Date().toISOString();
+      chat.messageCount = messageStore.get(jid).length;
+      chats.set(jid, chat);
+    }
+
+    res.json({ success: true, messageId: sentMsg.key.id });
+  } catch (error) {
+    console.error('Error sending message:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Disconnect WhatsApp
+app.post('/disconnect', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout();
+      sock = null;
+    }
+    connectionStatus = 'disconnected';
+    qrCode = null;
+    chats.clear();
+    messageStore.clear();
+    lidToPhoneMap.clear();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Reconnect WhatsApp
+app.post('/reconnect', async (req, res) => {
+  try {
+    if (sock) {
+      sock.end();
+      sock = null;
+    }
+    connectionStatus = 'reconnecting';
+    await connectToWhatsApp();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Resolve LID to real phone (manual endpoint)
+app.get('/resolve-lid/:lid', (req, res) => {
+  const { lid } = req.params;
+  const realPhone = lidToPhoneMap.get(decodeURIComponent(lid));
+  res.json({
+    success: true,
+    lid,
+    realPhone: realPhone || null,
+    resolved: !!realPhone,
+  });
+});
+
+// Get all LID mappings (for debugging)
+app.get('/lid-mappings', (req, res) => {
+  const mappings = Object.fromEntries(lidToPhoneMap);
+  res.json({
+    success: true,
+    mappings,
+    count: lidToPhoneMap.size,
+  });
+});
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`WhatsApp Bridge running on port ${PORT}`);
+  connectToWhatsApp();
+});
