@@ -1,11 +1,13 @@
-import makeWASocket, { 
+import pkg from '@whiskeysockets/baileys';
+const { 
+  default: makeWASocket, 
   DisconnectReason, 
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore
-} from '@whiskeysockets/baileys';
+} = pkg;
 import express from 'express';
-import { toDataURL } from 'qrcode';
+import QRCode from 'qrcode';
 import pino from 'pino';
 
 const app = express();
@@ -92,7 +94,7 @@ async function connectToWhatsApp() {
       const { connection, lastDisconnect, qr } = update;
       
       if (qr) {
-        qrCode = await toDataURL(qr);
+        qrCode = await QRCode.toDataURL(qr);
         connectionStatus = 'waiting_qr';
         console.log('QR Code generated');
       }
