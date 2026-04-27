@@ -248,13 +248,18 @@ async function downloadAndStoreMedia(msg) {
 const profilePicCache = {}
 const PROFILE_PIC_TTL = 1000 * 60 * 60 // 1 hour cache
 
-async function getProfilePicUrl(jid) {
+async function getProfilePicUrl(jid, forceRefresh = false) {
   const formattedJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`
   const cached = profilePicCache[formattedJid]
-  if (cached && Date.now() - cached.fetchedAt < PROFILE_PIC_TTL) return cached.url
-  if (!sock || connectionStatus !== 'connected') return null
+  if (!forceRefresh && cached && Date.now() - cached.fetchedAt < PROFILE_PIC_TTL) return cached.url
+  if (!sock || connectionStatus !== 'connected') {
+    console.log('[Bridge] Cannot fetch profile pic - not connected')
+    return null
+  }
   try {
+    console.log(`[Bridge] Fetching profile pic for ${formattedJid}...`)
     const url = await sock.profilePictureUrl(formattedJid, 'image')
+    console.log(`[Bridge] Profile pic found: ${url ? 'yes' : 'no (private)'}`)
     profilePicCache[formattedJid] = { url, fetchedAt: Date.now() }
     return url
   } catch {
@@ -481,6 +486,11 @@ async function startWhatsApp() {
             downloadAndStoreMedia(msg).catch(() => {})
           }
 
+          // Fetch profile pic if not cached (for new contacts)
+          if (!profilePicCache[jid] && !fromMe) {
+            getProfilePicUrl(jid).catch(() => {})
+          }
+
           console.log(`[Bridge] ${fromMe ? 'Sent' : 'Received'} ${jid}: ${body || '[empty]'}`)
 
           sendWebhook('message', {
@@ -698,17 +708,26 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // GET /profile-pic?jid=xxx - Get profile picture URL
+  // GET /profile-pic?jid=xxx&force=true - Get profile picture URL
   if (req.method === 'GET' && url.pathname === '/profile-pic') {
     const jid = url.searchParams.get('jid')
+    const force = url.searchParams.get('force') === 'true'
     if (!jid) {
       res.writeHead(400, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Missing jid parameter' }))
       return
     }
-    const picUrl = await getProfilePicUrl(jid)
+    const picUrl = await getProfilePicUrl(jid, force)
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ jid, profilePicUrl: picUrl }))
+    return
+  }
+
+  // POST /fetch-all-pics - Force fetch all profile pictures
+  if (req.method === 'POST' && url.pathname === '/fetch-all-pics') {
+    fetchAllProfilePics().catch(() => {})
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ status: 'fetching', message: 'Fetching profile pics in background' }))
     return
   }
 
